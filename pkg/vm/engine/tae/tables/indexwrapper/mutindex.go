@@ -4,7 +4,7 @@ import (
 	"github.com/RoaringBitmap/roaring"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/container/compute"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/compute"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 )
@@ -46,10 +46,15 @@ func (idx *mutableIndex) BatchUpsert(keysCtx *index.KeysCtx, offset uint32, ts u
 	return
 }
 
+func (idx *mutableIndex) HasDeleteFrom(key any, fromTs uint64) bool {
+	return idx.deletes.HasDeleteFrom(key, fromTs)
+}
+
 func (idx *mutableIndex) IsKeyDeleted(key any, ts uint64) (deleted, existed bool) {
 	return idx.deletes.IsKeyDeleted(key, ts)
 }
 
+func (idx *mutableIndex) GetMaxDeleteTS() uint64 { return idx.deletes.GetMaxTS() }
 func (idx *mutableIndex) Delete(key any, ts uint64) (err error) {
 	defer func() {
 		err = TranslateError(err)
@@ -65,6 +70,7 @@ func (idx *mutableIndex) Delete(key any, ts uint64) (err error) {
 func (idx *mutableIndex) GetActiveRow(key any) (row uint32, err error) {
 	defer func() {
 		err = TranslateError(err)
+		// logutil.Infof("[Trace][GetActiveRow] key=%v: err=%v", key, err)
 	}()
 	exist := idx.zonemap.Contains(key)
 	// 1. key is definitely not existed

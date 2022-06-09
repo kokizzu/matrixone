@@ -188,7 +188,12 @@ func NewWithSize(n int) *Batch {
 }
 
 func (bat *Batch) Shrink(sels []int64) {
+	mp := make(map[*vector.Vector]uint8)
 	for _, vec := range bat.Vecs {
+		if _, ok := mp[vec]; ok {
+			continue
+		}
+		mp[vec]++
 		vector.Shrink(vec, sels)
 	}
 	vs := bat.Zs
@@ -200,7 +205,12 @@ func (bat *Batch) Shrink(sels []int64) {
 
 func (bat *Batch) Shuffle(sels []int64, m *mheap.Mheap) error {
 	if len(sels) > 0 {
+		mp := make(map[*vector.Vector]uint8)
 		for _, vec := range bat.Vecs {
+			if _, ok := mp[vec]; ok {
+				continue
+			}
+			mp[vec]++
 			if err := vector.Shuffle(vec, sels, m); err != nil {
 				return err
 			}
@@ -240,7 +250,9 @@ func (bat *Batch) Clean(m *mheap.Mheap) {
 		}
 	}
 	for _, r := range bat.Rs {
-		r.Free(m)
+		if r != nil {
+			r.Free(m)
+		}
 	}
 	bat.Vecs = nil
 	bat.Zs = nil

@@ -17,6 +17,7 @@ package frontend
 import (
 	goErrors "errors"
 	"fmt"
+
 	"github.com/matrixorigin/matrixone/pkg/config"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -26,6 +27,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/moengine"
 	"github.com/matrixorigin/matrixone/pkg/vm/mempool"
 	"github.com/matrixorigin/matrixone/pkg/vm/mmu/guest"
+	"strings"
 )
 
 var (
@@ -68,6 +70,7 @@ func (ts *TxnState) isState(s int) bool {
 }
 
 func (ts *TxnState) switchToState(s int, err error) {
+	logutil.Infof("switch from %d to %d", ts.state, s)
 	ts.fromState = ts.state
 	ts.state = s
 	ts.err = err
@@ -95,7 +98,7 @@ var _ moengine.Txn = &TaeTxnDumpImpl{}
 type TaeTxnDumpImpl struct {
 }
 
-func InitTaeTxnImpl() *TaeTxnDumpImpl {
+func InitTaeTxnDumpImpl() *TaeTxnDumpImpl {
 	return &TaeTxnDumpImpl{}
 }
 
@@ -135,7 +138,7 @@ type TxnHandler struct {
 
 func InitTxnHandler(storage engine.Engine) *TxnHandler {
 	return &TxnHandler{
-		taeTxn:   InitTaeTxnImpl(),
+		taeTxn:   InitTaeTxnDumpImpl(),
 		txnState: InitTxnState(),
 		storage:  storage,
 	}
@@ -159,6 +162,8 @@ type Session struct {
 
 	Pu *config.ParameterUnit
 
+	IsInternal bool
+
 	ep *tree.ExportParam
 
 	closeRef      *CloseExportData
@@ -166,11 +171,15 @@ type Session struct {
 	txnCompileCtx *TxnCompilerContext
 	storage       engine.Engine
 	sql           string
+
+	sysVars         map[string]interface{}
+	userDefinedVars map[string]interface{}
+	gSysVars        *GlobalSystemVariables
 }
 
-func NewSession(proto Protocol, pdHook *PDCallbackImpl, gm *guest.Mmu, mp *mempool.Mempool, PU *config.ParameterUnit) *Session {
+func NewSession(proto Protocol, pdHook *PDCallbackImpl, gm *guest.Mmu, mp *mempool.Mempool, PU *config.ParameterUnit, gSysVars *GlobalSystemVariables) *Session {
 	txnHandler := InitTxnHandler(config.StorageEngine)
-	return &Session{
+	ses := &Session{
 		protocol: proto,
 		pdHook:   pdHook,
 		GuestMmu: gm,
@@ -183,17 +192,102 @@ func NewSession(proto Protocol, pdHook *PDCallbackImpl, gm *guest.Mmu, mp *mempo
 		},
 		txnHandler: txnHandler,
 		//TODO:fix database name after the catalog is ready
-		txnCompileCtx: InitTxnCompilerContext(txnHandler, proto.GetDatabaseName()),
-		storage:       config.StorageEngine,
+		txnCompileCtx:   InitTxnCompilerContext(txnHandler, proto.GetDatabaseName()),
+		storage:         config.StorageEngine,
+		sysVars:         gSysVars.CopySysVarsToSession(),
+		userDefinedVars: make(map[string]interface{}),
+		gSysVars:        gSysVars,
+	}
+	ses.txnCompileCtx.SetSession(ses)
+	return ses
+}
+
+// SetGlobalVar sets the value of system variable in global.
+//used by SET GLOBAL
+func (ses *Session) SetGlobalVar(name string, value interface{}) error {
+	return ses.gSysVars.SetGlobalSysVar(name, value)
+}
+
+// GetGlobalVar gets this value of the system variable in global
+func (ses *Session) GetGlobalVar(name string) (interface{}, error) {
+	if def, val, ok := ses.gSysVars.GetGlobalSysVar(name); ok {
+		if def.Scope == ScopeSession {
+			//empty
+			return nil, errorSystemVariableSessionEmpty
+		}
+		return val, nil
+	}
+	return nil, errorSystemVariableDoesNotExist
+}
+
+func (ses *Session) GetTxnCompileCtx() *TxnCompilerContext {
+	return ses.txnCompileCtx
+}
+
+// SetSessionVar sets the value of system variable in session
+func (ses *Session) SetSessionVar(name string, value interface{}) error {
+	if def, _, ok := ses.gSysVars.GetGlobalSysVar(name); ok {
+		if def.Scope == ScopeGlobal {
+			return errorSystemVariableIsGlobal
+		}
+		//scope session & both
+		if !def.Dynamic {
+			return errorSystemVariableIsReadOnly
+		}
+
+		cv, err := def.Type.Convert(value)
+		if err != nil {
+			return err
+		}
+		ses.sysVars[def.Name] = cv
+	} else {
+		return errorSystemVariableDoesNotExist
+	}
+	return nil
+}
+
+// GetSessionVar gets this value of the system variable in session
+func (ses *Session) GetSessionVar(name string) (interface{}, error) {
+	if def, gVal, ok := ses.gSysVars.GetGlobalSysVar(name); ok {
+		ciname := strings.ToLower(name)
+		if def.Scope == ScopeGlobal {
+			return gVal, nil
+		}
+		return ses.sysVars[ciname], nil
+	} else {
+		return nil, errorSystemVariableDoesNotExist
 	}
 }
 
-func (ses *Session) GetEpochgc() *PDCallbackImpl {
-	return ses.pdHook
+func (ses *Session) CopyAllSessionVars() map[string]interface{} {
+	cp := make(map[string]interface{})
+	for k, v := range ses.sysVars {
+		cp[k] = v
+	}
+	return cp
+}
+
+// SetUserDefinedVar sets the user defined variable to the value in session
+func (ses *Session) SetUserDefinedVar(name string, value interface{}) error {
+	ses.userDefinedVars[strings.ToLower(name)] = value
+	return nil
+}
+
+// GetUserDefinedVar gets value of the user defined variable
+func (ses *Session) GetUserDefinedVar(name string) (SystemVariableType, interface{}, error) {
+	val, ok := ses.userDefinedVars[strings.ToLower(name)]
+	if !ok {
+		return SystemVariableNullType{}, nil, nil
+	}
+	return InitSystemVariableStringType(name), val, nil
 }
 
 func (ses *Session) GetTxnHandler() *TxnHandler {
 	return ses.txnHandler
+}
+
+func (ses *Session) GetEpochgc() *PDCallbackImpl {
+	return ses.pdHook
 }
 
 func (ses *Session) GetTxnCompilerContext() *TxnCompilerContext {
@@ -261,6 +355,7 @@ func (th *TxnHandler) getTxnStateString() string {
 // IsInTaeTxn checks the session executes a txn
 func (th *TxnHandler) IsInTaeTxn() bool {
 	st := th.getTxnState()
+	logutil.Infof("current txn state %d", st)
 	if st == TxnAutocommit || st == TxnBegan {
 		return true
 	}
@@ -288,11 +383,12 @@ func (th *TxnHandler) createTxn(beganErr, autocommitErr error) (moengine.Txn, er
 			err = errorTaeTxnInIllegalState
 		}
 		if txn == nil {
-			txn = InitTaeTxnImpl()
+			txn = InitTaeTxnDumpImpl()
 		}
 	} else {
-		txn = InitTaeTxnImpl()
+		txn = InitTaeTxnDumpImpl()
 	}
+
 	return txn, err
 }
 
@@ -328,6 +424,7 @@ func (th *TxnHandler) StartByAutocommitIfNeeded() (bool, error) {
 	if th.IsInTaeTxn() {
 		return false, nil
 	}
+	logutil.Infof("need create new txn")
 	err = th.StartByAutocommit()
 	return true, err
 }
@@ -465,11 +562,11 @@ func (th *TxnHandler) CleanTxn() error {
 	logutil.Infof("clean tae txn")
 	switch th.txnState.getState() {
 	case TxnInit, TxnEnd:
-		th.taeTxn = InitTaeTxnImpl()
+		th.taeTxn = InitTaeTxnDumpImpl()
 		th.txnState.switchToState(TxnInit, nil)
 	case TxnErr:
 		logutil.Errorf("clean txn. Get error:%v txnError:%v", th.txnState.getError(), th.taeTxn.GetError())
-		th.taeTxn = InitTaeTxnImpl()
+		th.taeTxn = InitTaeTxnDumpImpl()
 		th.txnState.switchToState(TxnInit, nil)
 	}
 	return nil
@@ -477,16 +574,34 @@ func (th *TxnHandler) CleanTxn() error {
 
 var _ plan2.CompilerContext = &TxnCompilerContext{}
 
+type QueryType int
+
+const (
+	TXN_DEFAULT QueryType = iota
+	TXN_DELETE
+	TXN_UPDATE
+)
+
 type TxnCompilerContext struct {
 	dbName     string
+	QryTyp     QueryType
 	txnHandler *TxnHandler
+	ses        *Session
 }
 
 func InitTxnCompilerContext(txn *TxnHandler, db string) *TxnCompilerContext {
 	if len(db) == 0 {
 		db = "mo_catalog"
 	}
-	return &TxnCompilerContext{txnHandler: txn, dbName: db}
+	return &TxnCompilerContext{txnHandler: txn, dbName: db, QryTyp: TXN_DEFAULT}
+}
+
+func (tcc *TxnCompilerContext) SetSession(ses *Session) {
+	tcc.ses = ses
+}
+
+func (tcc *TxnCompilerContext) SetQueryType(qryTyp QueryType) {
+	tcc.QryTyp = qryTyp
 }
 
 func (tcc *TxnCompilerContext) SetDatabase(db string) {
@@ -547,6 +662,18 @@ func (tcc *TxnCompilerContext) Resolve(dbName string, tableName string) (*plan2.
 			})
 		}
 	}
+	if tcc.QryTyp != TXN_DEFAULT {
+		hideKey := table.GetHideKey(tcc.txnHandler.GetTxn().GetCtx())
+		defs = append(defs, &plan2.ColDef{
+			Name: hideKey.Name,
+			Typ: &plan2.Type{
+				Id:        plan.Type_TypeId(hideKey.Type.Oid),
+				Width:     hideKey.Type.Width,
+				Precision: hideKey.Type.Precision,
+			},
+			Primary: hideKey.Primary,
+		})
+	}
 
 	//convert
 	obj := &plan2.ObjectRef{
@@ -559,6 +686,104 @@ func (tcc *TxnCompilerContext) Resolve(dbName string, tableName string) (*plan2.
 		Cols: defs,
 	}
 	return obj, tableDef
+}
+
+func (tcc *TxnCompilerContext) ResolveVariable(varName string, isSystemVar, isGlobalVar bool) (interface{}, error) {
+	if isSystemVar {
+		if isGlobalVar {
+			return tcc.ses.GetGlobalVar(varName)
+		} else {
+			return tcc.ses.GetSessionVar(varName)
+		}
+	} else {
+		_, val, err := tcc.ses.GetUserDefinedVar(varName)
+		return val, err
+	}
+}
+
+func (tcc *TxnCompilerContext) GetPrimaryKeyDef(dbName string, tableName string) []*plan2.ColDef {
+	if len(dbName) == 0 {
+		dbName = tcc.DefaultDatabase()
+	}
+
+	//open database
+	db, err := tcc.txnHandler.GetStorage().Database(dbName, tcc.txnHandler.GetTxn().GetCtx())
+	if err != nil {
+		logutil.Errorf("get database %v error %v", dbName, err)
+		return nil
+	}
+
+	tableNames := db.Relations(tcc.txnHandler.GetTxn().GetCtx())
+	logutil.Infof("dbName %v tableNames %v", dbName, tableNames)
+
+	//open table
+	relation, err := db.Relation(tableName, tcc.txnHandler.GetTxn().GetCtx())
+	if err != nil {
+		logutil.Errorf("get table %v error %v", tableName, err)
+		return nil
+	}
+
+	priKeys := relation.GetPrimaryKeys(tcc.txnHandler.GetTxn().GetCtx())
+	if len(priKeys) == 0 {
+		return nil
+	}
+
+	var priDefs []*plan2.ColDef = nil
+	for _, key := range priKeys {
+		priDefs = append(priDefs, &plan2.ColDef{
+			Name: key.Name,
+			Typ: &plan2.Type{
+				Id:        plan.Type_TypeId(key.Type.Oid),
+				Width:     key.Type.Width,
+				Precision: key.Type.Precision,
+				Scale:     key.Type.Scale,
+				Size:      key.Type.Size,
+			},
+			Primary: key.Primary,
+		})
+	}
+	return priDefs
+}
+
+func (tcc *TxnCompilerContext) GetHideKeyDef(dbName string, tableName string) *plan2.ColDef {
+	if len(dbName) == 0 {
+		dbName = tcc.DefaultDatabase()
+	}
+
+	//open database
+	db, err := tcc.txnHandler.GetStorage().Database(dbName, tcc.txnHandler.GetTxn().GetCtx())
+	if err != nil {
+		logutil.Errorf("get database %v error %v", dbName, err)
+		return nil
+	}
+
+	tableNames := db.Relations(tcc.txnHandler.GetTxn().GetCtx())
+	logutil.Infof("dbName %v tableNames %v", dbName, tableNames)
+
+	//open table
+	relation, err := db.Relation(tableName, tcc.txnHandler.GetTxn().GetCtx())
+	if err != nil {
+		logutil.Errorf("get table %v error %v", tableName, err)
+		return nil
+	}
+
+	hideKey := relation.GetHideKey(tcc.txnHandler.GetTxn().GetCtx())
+	if hideKey == nil {
+		return nil
+	}
+
+	hideDef := &plan2.ColDef{
+		Name: hideKey.Name,
+		Typ: &plan2.Type{
+			Id:        plan.Type_TypeId(hideKey.Type.Oid),
+			Width:     hideKey.Type.Width,
+			Precision: hideKey.Type.Precision,
+			Scale:     hideKey.Type.Scale,
+			Size:      hideKey.Type.Size,
+		},
+		Primary: hideKey.Primary,
+	}
+	return hideDef
 }
 
 func (tcc *TxnCompilerContext) Cost(obj *plan2.ObjectRef, e *plan2.Expr) *plan2.Cost {

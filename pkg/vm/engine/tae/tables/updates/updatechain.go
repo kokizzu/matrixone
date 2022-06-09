@@ -86,6 +86,22 @@ func (chain *ColumnChain) TryUpdateNodeLocked(row uint32, v any, n txnif.UpdateN
 	return
 }
 
+func (chain *ColumnChain) OnReplayUpdateNode(updateNode txnif.UpdateNode) {
+	updateNode.(*ColumnNode).AttachTo(chain)
+	chain.mvcc.TrySetMaxVisible(updateNode.(*ColumnNode).commitTs)
+	mask := updateNode.GetMask()
+	vals := updateNode.GetValues()
+	iterator := mask.Iterator()
+	for iterator.HasNext() {
+		row := iterator.Next()
+		val := vals[row]
+		err := chain.TryUpdateNodeLocked(row, val, updateNode)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
 func (chain *ColumnChain) AddNodeLocked(txn txnif.AsyncTxn) txnif.UpdateNode {
 	node := NewColumnNode(txn, chain.id, nil)
 	node.AttachTo(chain)
@@ -146,16 +162,6 @@ func (chain *ColumnChain) UpdateLocked(node *ColumnNode) {
 
 func (chain *ColumnChain) StringLocked() string {
 	return chain.view.StringLocked()
-	// msg := fmt.Sprintf("Block-%s-Col[%d]-Chain:", chain.id.ToBlockFileName(), chain.id.Idx)
-	// line := 1
-	// chain.LoopChainLocked(func(n *ColumnNode) bool {
-	// 	n.RLock()
-	// 	msg = fmt.Sprintf("%s\n%d. %s", msg, line, n.StringLocked())
-	// 	n.RUnlock()
-	// 	line++
-	// 	return true
-	// }, false)
-	// return msg
 }
 
 func (chain *ColumnChain) GetValueLocked(row uint32, ts uint64) (v any, err error) {

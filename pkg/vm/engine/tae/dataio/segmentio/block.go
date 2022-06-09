@@ -25,8 +25,8 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	gvec "github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/compute"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/container/compute"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/file"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/indexwrapper"
@@ -34,7 +34,7 @@ import (
 
 type blockFile struct {
 	common.RefHelper
-	seg       file.Segment
+	seg       *segmentFile
 	rows      uint32
 	id        uint64
 	ts        uint64
@@ -44,13 +44,16 @@ type blockFile struct {
 	destroy   sync.Mutex
 }
 
-func newBlock(id uint64, seg file.Segment, colCnt int, indexCnt map[int]int) *blockFile {
+func newBlock(id uint64, seg *segmentFile, colCnt int, indexCnt map[int]int) *blockFile {
 	bf := &blockFile{
 		seg:     seg,
 		id:      id,
 		columns: make([]*columnBlock, colCnt),
 	}
 	bf.deletes = newDeletes(bf)
+	bf.deletes.file = make([]*DriverFile, 1)
+	bf.deletes.file[0] = bf.seg.GetSegmentFile().NewBlockFile(
+		fmt.Sprintf("%d_%d.del", colCnt, bf.id))
 	bf.indexMeta = newIndex(&columnBlock{block: bf}).dataFile
 	bf.OnZeroCB = bf.close
 	for i := range bf.columns {
@@ -64,13 +67,14 @@ func newBlock(id uint64, seg file.Segment, colCnt int, indexCnt map[int]int) *bl
 	return bf
 }
 
-func replayBlock(id uint64, seg file.Segment, colCnt int, indexCnt map[int]int) *blockFile {
+func replayBlock(id uint64, seg *segmentFile, colCnt int, indexCnt map[int]int) *blockFile {
 	bf := &blockFile{
 		seg:     seg,
 		id:      id,
 		columns: make([]*columnBlock, colCnt),
 	}
 	bf.deletes = newDeletes(bf)
+	bf.deletes.file = make([]*DriverFile, 1)
 	bf.indexMeta = newIndex(&columnBlock{block: bf}).dataFile
 	bf.OnZeroCB = bf.close
 	for i := range bf.columns {
@@ -109,6 +113,12 @@ func (bf *blockFile) ReadRows() uint32 {
 
 func (bf *blockFile) WriteTS(ts uint64) (err error) {
 	bf.ts = ts
+	if bf.deletes.file != nil {
+		bf.deletes.mutex.Lock()
+		defer bf.deletes.mutex.Unlock()
+		bf.deletes.file = append(bf.deletes.file,
+			bf.seg.GetSegmentFile().NewBlockFile(fmt.Sprintf("%d_%d_%d.del", len(bf.columns), bf.id, ts)))
+	}
 	return
 }
 
@@ -158,14 +168,6 @@ func (bf *blockFile) OpenColumn(colIdx int) (colBlk file.ColumnBlock, err error)
 
 func (bf *blockFile) Close() error {
 	return nil
-}
-
-func (bf *blockFile) removeData(data *dataFile) {
-	if data.file != nil {
-		for _, file := range data.file {
-			bf.seg.GetSegmentFile().ReleaseFile(file)
-		}
-	}
 }
 
 func (bf *blockFile) Destroy() error {
@@ -306,6 +308,9 @@ func (bf *blockFile) WriteIBatch(bat batch.IBatch, ts uint64, masks map[uint16]*
 		}
 	}
 	if err = bf.WriteTS(ts); err != nil {
+		return err
+	}
+	if err = bf.WriteRows(uint32(bat.Length())); err != nil {
 		return err
 	}
 	for _, colIdx := range attrs {

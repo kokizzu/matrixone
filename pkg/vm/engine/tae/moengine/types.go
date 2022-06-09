@@ -49,6 +49,7 @@ type txnDatabase struct {
 
 type txnRelation struct {
 	handle handle.Relation
+	nodes  engine.Nodes
 }
 
 type txnBlock struct {
@@ -60,4 +61,6 @@ type txnReader struct {
 	it           handle.BlockIt
 	compressed   []*bytes.Buffer
 	decompressed []*bytes.Buffer
+	zs           []int64
+	latency      int64
 }

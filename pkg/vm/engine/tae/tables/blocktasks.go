@@ -58,6 +58,7 @@ func (blk *dataBlock) CheckpointWAL(endTs uint64) (err error) {
 
 func (blk *dataBlock) BlkCheckpointWAL(endTs uint64) (err error) {
 	ckpTs := blk.GetMaxCheckpointTS()
+	logutil.Infof("BlkCheckpointWAL | %s | [%d/%d]", blk.meta.Repr(), ckpTs, endTs)
 	if endTs <= ckpTs {
 		return
 	}
@@ -85,14 +86,15 @@ func (blk *dataBlock) BlkCheckpointWAL(endTs uint64) (err error) {
 
 func (blk *dataBlock) ABlkCheckpointWAL(endTs uint64) (err error) {
 	ckpTs := blk.GetMaxCheckpointTS()
+	logutil.Infof("ABlkCheckpointWAL | %s | [%d/%d]", blk.meta.Repr(), ckpTs, endTs)
 	if endTs <= ckpTs {
 		return
 	}
-	indexes, err := blk.CollectAppendLogIndexes(ckpTs+1, endTs)
+	indexes, err := blk.CollectAppendLogIndexes(ckpTs+1, endTs+1)
 	if err != nil {
 		return
 	}
-	view, err := blk.CollectChangesInRange(ckpTs+1, endTs)
+	view, err := blk.CollectChangesInRange(ckpTs+1, endTs+1)
 	if err != nil {
 		return
 	}
@@ -100,6 +102,9 @@ func (blk *dataBlock) ABlkCheckpointWAL(endTs uint64) (err error) {
 		if err = blk.scheduler.Checkpoint(idxes); err != nil {
 			return
 		}
+		// for _, index := range idxes {
+		// 	logutil.Infof("Ckp1Index  %s", index.String())
+		// }
 	}
 	if err = blk.scheduler.Checkpoint(indexes); err != nil {
 		return
@@ -109,6 +114,9 @@ func (blk *dataBlock) ABlkCheckpointWAL(endTs uint64) (err error) {
 	}
 	logutil.Infof("ABLK | [%d,%d] | CNT=[%d] | Checkpointed | %s", ckpTs+1, endTs, len(indexes), blk.meta.String())
 	// for _, index := range indexes {
+	// 	logutil.Infof("Ckp1Index  %s", index.String())
+	// }
+	// for _, index := range view.DeleteLogIndexes {
 	// 	logutil.Infof("Ckp1Index  %s", index.String())
 	// }
 	blk.SetMaxCheckpointTS(endTs)
@@ -185,7 +193,7 @@ func (blk *dataBlock) ABlkFlushData(ts uint64, bat batch.IBatch, masks map[uint1
 	}
 	ckpTs := blk.GetMaxCheckpointTS()
 	if ts <= ckpTs {
-		logutil.Infof("FLUSH ABLK | [%s] | CANCELLED | (State Request: Already Compacted)", blk.meta.String())
+		logutil.Infof("FLUSH ABLK | [%s] | CANCELLED | (Stale Request: Already Compacted)", blk.meta.String())
 		return data.ErrStaleRequest
 	}
 

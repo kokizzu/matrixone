@@ -50,6 +50,7 @@ type TxnReader interface {
 	GetStore() TxnStore
 	String() string
 	Repr() string
+	GetLSN() uint64
 }
 
 type TxnHandle interface {
@@ -161,6 +162,8 @@ type UpdateNode interface {
 	String() string
 	GetChain() UpdateChain
 	GetDLNode() *common.DLNode
+	GetMask() *roaring.Bitmap
+	GetValues() map[uint32]interface{}
 
 	UpdateLocked(row uint32, v any) error
 }
@@ -169,8 +172,9 @@ type TxnStore interface {
 	Txn2PC
 	io.Closer
 	BindTxn(AsyncTxn)
+	GetLSN() uint64
 
-	BatchDedup(dbId, id uint64, pks *vector.Vector) error
+	BatchDedup(dbId, id uint64, pks ...*vector.Vector) error
 	LogSegmentID(dbId, tid, sid uint64)
 	LogBlockID(dbId, tid, bid uint64)
 

@@ -59,13 +59,13 @@ func Open(dirname string, opts *options.Options) (db *DB, err error) {
 		IndexBufMgr: indexBufMgr,
 		MTBufMgr:    mutBufMgr,
 		TxnBufMgr:   txnBufMgr,
+		FileFactory: segmentio.SegmentFactory,
 		Closed:      new(atomic.Value),
 	}
 
 	db.Wal = wal.NewDriver(dirname, WALDir, nil)
 	db.Scheduler = newTaskScheduler(db, db.Opts.SchedulerCfg.AsyncWorkers, db.Opts.SchedulerCfg.IOWorkers)
-	dataFactory := tables.NewDataFactory(segmentio.SegmentFileIOFactory, mutBufMgr, db.Scheduler, db.Dir)
-	//dataOpenFactory := tables.NewDataFactory(segmentio.SegmentFileIOOpenFactory, mutBufMgr, db.Scheduler, db.Dir)
+	dataFactory := tables.NewDataFactory(db.FileFactory, mutBufMgr, db.Scheduler, db.Dir)
 	if db.Opts.Catalog, err = catalog.OpenCatalog(dirname, CATALOGDir, nil, db.Scheduler, dataFactory); err != nil {
 		return
 	}
@@ -77,6 +77,7 @@ func Open(dirname string, opts *options.Options) (db *DB, err error) {
 	db.TxnMgr = txnbase.NewTxnManager(txnStoreFactory, txnFactory)
 
 	db.Replay(dataFactory)
+	db.Catalog.ReplayTableRows()
 
 	db.TxnMgr.Start()
 

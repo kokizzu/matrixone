@@ -48,25 +48,27 @@ func (mce *MysqlCmdExecutor) handleInsertValues(stmt *tree.Insert, ts uint64) er
 	}
 
 	defer plan.relation.Close(snapshot)
+	if err := plan.relation.Write(ts, plan.dataBatch, snapshot); err != nil {
+		return err
+	}
 
 	resp := NewOkResponse(uint64(vector.Length(plan.dataBatch.Vecs[0])), 0, 0, 0, int(COM_QUERY), "")
 	if err := mce.GetSession().protocol.SendResponse(resp); err != nil {
 		return fmt.Errorf("routine send response failed. error:%v ", err)
 	}
-
-	return plan.relation.Write(ts, plan.dataBatch, snapshot)
+	return nil
 }
 
-func getTableRef(tbl *tree.TableName, currentDB string, eg engine.Engine) (string, string, engine.Relation, error) {
+func getTableRef(tbl *tree.TableName, currentDB string, eg engine.Engine, snapshot engine.Snapshot) (string, string, engine.Relation, error) {
 	if len(tbl.SchemaName) == 0 {
 		tbl.SchemaName = tree.Identifier(currentDB)
 	}
 
-	db, err := eg.Database(string(tbl.SchemaName), nil)
+	db, err := eg.Database(string(tbl.SchemaName), snapshot)
 	if err != nil {
 		return "", "", nil, errors.New(errno.InvalidSchemaName, err.Error())
 	}
-	r, err := db.Relation(string(tbl.ObjectName), nil)
+	r, err := db.Relation(string(tbl.ObjectName), snapshot)
 	if err != nil {
 		return "", "", nil, errors.New(errno.UndefinedTable, err.Error())
 	}
@@ -85,7 +87,7 @@ func buildInsertValues(stmt *tree.Insert, plan *InsertValues, eg engine.Engine, 
 
 	rows = stmt.Rows.Select.(*tree.ValuesClause)
 
-	db, id, relation, err := getTableRef(stmt.Table.(*tree.TableName), plan.currentDb, eg)
+	db, id, relation, err := getTableRef(stmt.Table.(*tree.TableName), plan.currentDb, eg, snapshot)
 	if err != nil {
 		return err
 	}

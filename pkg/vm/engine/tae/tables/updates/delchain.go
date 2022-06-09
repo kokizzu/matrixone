@@ -20,9 +20,10 @@ import (
 	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
 )
 
@@ -106,6 +107,8 @@ func (chain *DeleteChain) IsDeleted(row uint32, ts uint64, rwlocker *sync.RWMute
 				// logutil.Infof("%d -- wait --> %s: %d", ts, txn.Repr(), state)
 				if state == txnif.TxnStateCommitted {
 					deleted = true
+				} else if state == txnif.TxnStateCommitting {
+					logutil.Fatal("txn state error")
 				} else if state == txnif.TxnStateUnknown {
 					err = txnif.TxnInternalErr
 				}
@@ -126,7 +129,7 @@ func (chain *DeleteChain) PrepareRangeDelete(start, end uint32, ts uint64) (err 
 		overlap := n.HasOverlapLocked(start, end)
 		if overlap {
 			if n.txn == nil || n.txn.GetStartTS() == ts {
-				err = txnbase.ErrNotFound
+				err = data.ErrNotFound
 			} else {
 				err = txnif.TxnWWConflictErr
 			}
@@ -151,6 +154,11 @@ func (chain *DeleteChain) AddNodeLocked(txn txnif.AsyncTxn) txnif.DeleteNode {
 	node := NewDeleteNode(txn)
 	node.AttachTo(chain)
 	return node
+}
+
+func (chain *DeleteChain) OnReplayNode(deleteNode *DeleteNode) {
+	deleteNode.AttachTo(chain)
+	chain.AddDeleteCnt(uint32(deleteNode.mask.GetCardinality()))
 }
 
 func (chain *DeleteChain) AddMergeNode() txnif.DeleteNode {

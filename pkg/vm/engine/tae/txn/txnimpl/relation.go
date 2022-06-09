@@ -22,9 +22,10 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/container/compute"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/compute"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 )
 
@@ -139,12 +140,12 @@ func (h *txnRelation) GetMeta() any   { return h.table.entry }
 func (h *txnRelation) GetSchema() any { return h.table.entry.GetSchema() }
 
 func (h *txnRelation) Close() error                     { return nil }
-func (h *txnRelation) Rows() int64                      { return 0 }
+func (h *txnRelation) Rows() int64                      { return int64(h.table.entry.GetRows()) }
 func (h *txnRelation) Size(attr string) int64           { return 0 }
 func (h *txnRelation) GetCardinality(attr string) int64 { return 0 }
 
-func (h *txnRelation) BatchDedup(col *vector.Vector) error {
-	return h.Txn.GetStore().BatchDedup(h.table.entry.GetDB().ID, h.table.entry.GetID(), col)
+func (h *txnRelation) BatchDedup(cols ...*vector.Vector) error {
+	return h.Txn.GetStore().BatchDedup(h.table.entry.GetDB().ID, h.table.entry.GetID(), cols...)
 }
 
 func (h *txnRelation) Append(data *batch.Batch) error {
@@ -183,6 +184,15 @@ func (h *txnRelation) GetByFilter(filter *handle.Filter) (*common.ID, uint32, er
 	return h.Txn.GetStore().GetByFilter(h.table.entry.GetDB().ID, h.table.entry.GetID(), filter)
 }
 
+func (h *txnRelation) GetValueByFilter(filter *handle.Filter, col int) (v any, err error) {
+	id, row, err := h.GetByFilter(filter)
+	if err != nil {
+		return
+	}
+	v, err = h.GetValue(id, row, uint16(col))
+	return
+}
+
 func (h *txnRelation) UpdateByFilter(filter *handle.Filter, col uint16, v any) (err error) {
 	id, row, err := h.table.GetByFilter(filter)
 	if err != nil {
@@ -190,30 +200,88 @@ func (h *txnRelation) UpdateByFilter(filter *handle.Filter, col uint16, v any) (
 	}
 	schema := h.table.entry.GetSchema()
 	if !schema.IsPartOfPK(int(col)) {
-		err = h.table.Update(id, row, col, v)
+		err = h.Update(id, row, col, v)
 		return
 	}
-	bat := catalog.MockData(schema, 0)
-	for i := range schema.ColDefs {
-		colVal, err := h.table.GetValue(id, row, uint16(i))
+	bat := batch.New(true, []string{})
+	for _, def := range schema.ColDefs {
+		if def.IsHidden() {
+			continue
+		}
+		colVal, err := h.table.GetValue(id, row, uint16(def.Idx))
 		if err != nil {
 			return err
 		}
-		compute.AppendValue(bat.Vecs[i], colVal)
+		vec := vector.New(def.Type)
+		compute.AppendValue(vec, colVal)
+		bat.Vecs = append(bat.Vecs, vec)
+		bat.Attrs = append(bat.Attrs, def.Name)
 	}
 	if err = h.table.RangeDelete(id, row, row); err != nil {
 		return
 	}
-	err = h.table.Append(bat)
+	err = h.Append(bat)
 	return
+}
+
+func (h *txnRelation) UpdateByHiddenKey(key any, col int, v any) error {
+	sid, bid, row := model.DecodeHiddenKeyFromValue(key)
+	id := &common.ID{
+		TableID:   h.table.entry.ID,
+		SegmentID: sid,
+		BlockID:   bid,
+	}
+	return h.Txn.GetStore().Update(h.table.entry.GetDB().ID, id, row, uint16(col), v)
 }
 
 func (h *txnRelation) Update(id *common.ID, row uint32, col uint16, v any) error {
 	return h.Txn.GetStore().Update(h.table.entry.GetDB().ID, id, row, col, v)
 }
 
+func (h *txnRelation) DeleteByFilter(filter *handle.Filter) (err error) {
+	id, row, err := h.GetByFilter(filter)
+	if err != nil {
+		return
+	}
+	return h.RangeDelete(id, row, row)
+}
+
+func (h *txnRelation) DeleteByHiddenKeys(keys *vector.Vector) (err error) {
+	id := &common.ID{
+		TableID: h.table.entry.ID,
+	}
+	var row uint32
+	dbId := h.table.entry.GetDB().ID
+	err = compute.ForEachValue(keys, false, func(key any, _ uint32) (err error) {
+		id.SegmentID, id.BlockID, row = model.DecodeHiddenKeyFromValue(key)
+		err = h.Txn.GetStore().RangeDelete(dbId, id, row, row)
+		return
+	})
+	return
+}
+
+func (h *txnRelation) DeleteByHiddenKey(key any) error {
+	sid, bid, row := model.DecodeHiddenKeyFromValue(key)
+	id := &common.ID{
+		TableID:   h.table.entry.ID,
+		SegmentID: sid,
+		BlockID:   bid,
+	}
+	return h.Txn.GetStore().RangeDelete(h.table.entry.GetDB().ID, id, row, row)
+}
+
 func (h *txnRelation) RangeDelete(id *common.ID, start, end uint32) error {
 	return h.Txn.GetStore().RangeDelete(h.table.entry.GetDB().ID, id, start, end)
+}
+
+func (h *txnRelation) GetValueByHiddenKey(key any, col int) (any, error) {
+	sid, bid, row := model.DecodeHiddenKeyFromValue(key)
+	id := &common.ID{
+		TableID:   h.table.entry.ID,
+		SegmentID: sid,
+		BlockID:   bid,
+	}
+	return h.Txn.GetStore().GetValue(h.table.entry.GetDB().ID, id, row, uint16(col))
 }
 
 func (h *txnRelation) GetValue(id *common.ID, row uint32, col uint16) (any, error) {

@@ -17,21 +17,45 @@ package segmentio
 import (
 	"bytes"
 	"fmt"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/file"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/layout/segment"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/file"
 )
 
-var SegmentFileIOFactory = func(name string, id uint64) file.Segment {
-	return newSegmentFile(name, id)
+var SegmentFactory file.SegmentFactory
+
+func init() {
+	SegmentFactory = new(segmentFactory)
 }
 
-var SegmentFileIOOpenFactory = func(name string, id uint64) file.Segment {
+type segmentFactory struct{}
+
+func (factory *segmentFactory) Build(dir string, id uint64) file.Segment {
+	baseName := factory.EncodeName(id)
+	name := path.Join(dir, baseName)
 	return openSegment(name, id)
+}
+
+func (factory *segmentFactory) EncodeName(id uint64) string {
+	return fmt.Sprintf("%d.seg", id)
+}
+
+func (factory *segmentFactory) DecodeName(name string) (id uint64, err error) {
+	trimmed := strings.TrimSuffix(name, ".seg")
+	if trimmed == name {
+		err = fmt.Errorf("%w: %s", file.ErrInvalidName, name)
+		return
+	}
+	id, err = strconv.ParseUint(trimmed, 10, 64)
+	if err != nil {
+		err = fmt.Errorf("%w: %s", file.ErrInvalidName, name)
+	}
+	return
 }
 
 type segmentFile struct {
@@ -41,7 +65,7 @@ type segmentFile struct {
 	ts     uint64
 	blocks map[uint64]*blockFile
 	name   string
-	seg    *segment.Segment
+	driver *Driver
 }
 
 func openSegment(name string, id uint64) *segmentFile {
@@ -49,11 +73,12 @@ func openSegment(name string, id uint64) *segmentFile {
 		blocks: make(map[uint64]*blockFile),
 		name:   name,
 	}
-	sf.seg = &segment.Segment{}
-	err := sf.seg.Open(sf.name)
+	sf.driver = &Driver{}
+	err := sf.driver.Open(sf.name)
 	if err != nil {
-		return nil
+		panic(any(err.Error()))
 	}
+	sf.driver.Mount()
 	sf.id = &common.ID{
 		SegmentID: id,
 	}
@@ -61,6 +86,8 @@ func openSegment(name string, id uint64) *segmentFile {
 	sf.OnZeroCB = sf.close
 	return sf
 }
+
+func (sf *segmentFile) Name() string { return sf.name }
 
 func (sf *segmentFile) RemoveBlock(id uint64) {
 	sf.Lock()
@@ -72,16 +99,24 @@ func (sf *segmentFile) RemoveBlock(id uint64) {
 	delete(sf.blocks, id)
 }
 
+func (sf *segmentFile) replayInfo(stat *fileStat, file *DriverFile) {
+	meta := file.GetInode()
+	stat.size = meta.GetFileSize()
+	stat.originSize = meta.GetOriginSize()
+	stat.algo = meta.GetAlgo()
+	stat.name = file.GetName()
+}
+
 func (sf *segmentFile) Replay(colCnt int, indexCnt map[int]int, cache *bytes.Buffer) error {
-	err := sf.seg.Replay(cache)
+	err := sf.driver.Replay(cache)
 	if err != nil {
 		return err
 	}
-	nodes := sf.seg.GetNodes()
+	nodes := sf.driver.GetNodes()
 	sf.Lock()
 	defer sf.Unlock()
 	for name, file := range nodes {
-		tmpName := strings.Split(name, ".blk")
+		tmpName := strings.Split(name, ".")
 		fileName := strings.Split(tmpName[0], "_")
 		if len(fileName) < 2 {
 			continue
@@ -99,42 +134,60 @@ func (sf *segmentFile) Replay(colCnt int, indexCnt map[int]int, cache *bytes.Buf
 		if err != nil {
 			return err
 		}
-		bf.columns[col].data.file = append(bf.columns[col].data.file, file)
-		bf.columns[col].data.stat.size = file.GetFileSize()
-		bf.columns[col].data.stat.originSize = file.GetOriginSize()
-		bf.columns[col].data.stat.algo = file.GetAlgo()
-		bf.columns[col].data.stat.name = file.GetName()
+		var ts uint64 = 0
 		if len(fileName) > 2 {
-			ts, err := strconv.ParseUint(fileName[2], 10, 64)
+			ts, err = strconv.ParseUint(fileName[2], 10, 64)
 			if err != nil {
 				return err
 			}
+		}
+		switch tmpName[1] {
+		case "blk":
+			if ts == 0 {
+				bf.columns[col].ts = 0
+				bf.columns[col].data.file[0] = file
+				sf.replayInfo(bf.columns[col].data.stat, file)
+				break
+			}
 			if bf.columns[col].ts < ts {
 				bf.columns[col].ts = ts
+				bf.columns[col].data.file[0] = file
+				sf.replayInfo(bf.columns[col].data.stat, file)
 			}
+			if bf.ts <= ts {
+				bf.ts = ts
+				bf.rows = file.GetInode().GetRows()
+			}
+		case "update":
+			if ts == 0 {
+				bf.columns[col].ts = 0
+				bf.columns[col].updates.file[0] = file
+				sf.replayInfo(bf.columns[col].updates.stat, file)
+				break
+			}
+			if bf.columns[col].ts < ts {
+				bf.columns[col].ts = ts
+				bf.columns[col].updates.file[0] = file
+				sf.replayInfo(bf.columns[col].updates.stat, file)
+			}
+		case "del":
+			if ts == 0 {
+				bf.ts = 0
+				bf.deletes.file[0] = file
+				sf.replayInfo(bf.deletes.stat, file)
+				break
+			}
+			if bf.ts < ts {
+				bf.ts = ts
+				bf.deletes.file[0] = file
+				sf.replayInfo(bf.deletes.stat, file)
+			}
+		default:
+			panic(any("No Support"))
 		}
 
 	}
 	return nil
-}
-
-func newSegmentFile(name string, id uint64) *segmentFile {
-	sf := &segmentFile{
-		blocks: make(map[uint64]*blockFile),
-		name:   name,
-	}
-	sf.seg = &segment.Segment{}
-	err := sf.seg.Init(sf.name)
-	if err != nil {
-		return nil
-	}
-	sf.seg.Mount()
-	sf.id = &common.ID{
-		SegmentID: id,
-	}
-	sf.Ref()
-	sf.OnZeroCB = sf.close
-	return sf
 }
 
 func (sf *segmentFile) Fingerprint() *common.ID { return sf.id }
@@ -144,15 +197,15 @@ func (sf *segmentFile) close() {
 	sf.Destroy()
 }
 func (sf *segmentFile) Destroy() {
-	logutil.Infof("Destroying Segment %d", sf.id.SegmentID)
+	logutil.Infof("Destroying Driver %d", sf.id.SegmentID)
 	sf.RLock()
 	blocks := sf.blocks
 	sf.RUnlock()
 	for _, block := range blocks {
 		block.Destroy()
 	}
-	sf.seg.Unmount()
-	sf.seg.Destroy()
+	sf.driver.Unmount()
+	sf.driver.Destroy()
 }
 
 func (sf *segmentFile) OpenBlock(id uint64, colCnt int, indexCnt map[int]int) (block file.Block, err error) {
@@ -181,10 +234,10 @@ func (sf *segmentFile) String() string {
 	return s
 }
 
-func (sf *segmentFile) GetSegmentFile() *segment.Segment {
-	return sf.seg
+func (sf *segmentFile) GetSegmentFile() *Driver {
+	return sf.driver
 }
 
 func (sf *segmentFile) Sync() error {
-	return sf.seg.Sync()
+	return sf.driver.Sync()
 }

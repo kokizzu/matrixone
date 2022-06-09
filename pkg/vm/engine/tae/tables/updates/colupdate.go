@@ -25,7 +25,8 @@ import (
 	gvec "github.com/matrixorigin/matrixone/pkg/container/vector"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/container/compute"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/compute"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
@@ -97,6 +98,10 @@ func (node *ColumnNode) GetID() *common.ID {
 	return node.id
 }
 
+func (node *ColumnNode) SetLogIndex(idx *wal.Index) {
+	node.logIndex = idx
+}
+
 func (node *ColumnNode) GetChain() txnif.UpdateChain {
 	return node.chain
 }
@@ -136,7 +141,7 @@ func (node *ColumnNode) Compare(o common.NodePayload) int {
 func (node *ColumnNode) GetValueLocked(row uint32) (v any, err error) {
 	v = node.txnVals[row]
 	if v == nil {
-		err = txnbase.ErrNotFound
+		err = data.ErrNotFound
 	}
 	return
 }
@@ -206,6 +211,10 @@ func (node *ColumnNode) ReadFrom(r io.Reader) (n int64, err error) {
 		node.txnVals[key] = v
 		row++
 	}
+	if err = binary.Read(r, binary.BigEndian, &node.commitTs); err != nil {
+		return
+	}
+	n += 8
 	return
 }
 
@@ -245,7 +254,14 @@ func (node *ColumnNode) WriteTo(w io.Writer) (n int64, err error) {
 	}
 	n += 4
 	cn, err = w.Write(buf)
+	if err != nil {
+		return
+	}
 	n += int64(cn)
+	if err = binary.Write(w, binary.BigEndian, node.commitTs); err != nil {
+		return
+	}
+	n += 8
 	return
 }
 
@@ -284,7 +300,7 @@ func (node *ColumnNode) StringLocked() string {
 	if node.commitTs == txnif.UncommitTS {
 		commitState = "UC"
 	}
-	s := fmt.Sprintf("[%s:%s](%d-%d)[", commitState, node.id.ToBlockFileName(), node.startTs, node.commitTs)
+	s := fmt.Sprintf("[%s:%s](%d-%d)[", commitState, node.id.BlockString(), node.startTs, node.commitTs)
 	for k, v := range node.txnVals {
 		s = fmt.Sprintf("%s%d:%v,", s, k, v)
 	}

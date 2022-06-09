@@ -34,13 +34,21 @@ type Relation interface {
 	MakeSegmentIt() SegmentIt
 	MakeBlockIt() BlockIt
 
+	DeleteByHiddenKey(key any) error
+	UpdateByHiddenKey(key any, col int, v any) error
+	GetValueByHiddenKey(key any, col int) (any, error)
+
+	DeleteByHiddenKeys(keys *vector.Vector) error
+
 	RangeDelete(id *common.ID, start, end uint32) error
 	Update(id *common.ID, row uint32, col uint16, v any) error
 	GetByFilter(filter *Filter) (id *common.ID, offset uint32, err error)
 	GetValue(id *common.ID, row uint32, col uint16) (any, error)
+	GetValueByFilter(filter *Filter, col int) (any, error)
 	UpdateByFilter(filter *Filter, col uint16, v any) error
+	DeleteByFilter(filter *Filter) error
 
-	BatchDedup(col *vector.Vector) error
+	BatchDedup(cols ...*vector.Vector) error
 	Append(data *batch.Batch) error
 
 	GetMeta() any

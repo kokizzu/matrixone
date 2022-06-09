@@ -42,6 +42,9 @@ func (index *immutableIndex) Dedup(key any) (err error) {
 	return
 }
 
+func (index *immutableIndex) GetMaxDeleteTS() uint64                    { panic("not supported") }
+func (index *immutableIndex) HasDeleteFrom(key any, fromTs uint64) bool { panic("not supported") }
+
 func (index *immutableIndex) BatchDedup(keys *vector.Vector, rowmask *roaring.Bitmap) (keyselects *roaring.Bitmap, err error) {
 	keyselects, exist := index.zmReader.ContainsAny(keys)
 	// 1. all keys are not in [min, max]. definitely not
@@ -68,22 +71,26 @@ func (index *immutableIndex) Close() (err error) {
 }
 
 func (index *immutableIndex) Destroy() (err error) {
-	if err = index.zmReader.Destroy(); err != nil {
-		return
+	if index.zmReader != nil {
+		if err = index.zmReader.Destroy(); err != nil {
+			return
+		}
 	}
-	err = index.bfReader.Destroy()
+	if index.bfReader != nil {
+		err = index.bfReader.Destroy()
+	}
 	return
 }
 
 func (index *immutableIndex) ReadFrom(blk data.Block) (err error) {
+	entry := blk.GetMeta().(*catalog.BlockEntry)
 	file := blk.GetBlockFile()
 	idxMeta, err := file.LoadIndexMeta()
 	if err != nil {
 		return
 	}
 	metas := idxMeta.(*IndicesMeta)
-	entry := blk.GetMeta().(*catalog.BlockEntry)
-	colFile, err := file.OpenColumn(int(entry.GetSchema().PrimaryKey))
+	colFile, err := file.OpenColumn(entry.GetSchema().SortKey.Defs[0].Idx)
 	if err != nil {
 		return
 	}

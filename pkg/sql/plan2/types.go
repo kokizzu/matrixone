@@ -39,6 +39,12 @@ type CompilerContext interface {
 	DatabaseExists(name string) bool
 	// get table definition by database/schema
 	Resolve(schemaName string, tableName string) (*ObjectRef, *TableDef)
+	// get the value of variable
+	ResolveVariable(varName string, isSystemVar, isGlobalVar bool) (interface{}, error)
+	// get the definition of primary key
+	GetPrimaryKeyDef(dbName string, tableName string) []*ColDef
+	// get the definition of hide key
+	GetHideKeyDef(dbName string, tableName string) *ColDef
 	// get estimated cost by table & expr
 	Cost(obj *ObjectRef, e *Expr) *Cost
 }
@@ -73,4 +79,11 @@ type BinderContext struct {
 	// subqueryIsScalar     bool
 
 	subqueryParentIds []int32
+
+	// use to storage the using columns.
+	// select R.*, S.* from R, S using(a) where S.a > 10
+	// then we store {'a':'S'},
+	// when we use buildUnresolvedName(), and the colName = 'a' and tableName = 'S', we reset tableName=''
+	// because the ProjectNode(after JoinNode) had coalesced the using cols
+	usingCols map[string]string
 }

@@ -18,10 +18,9 @@ import (
 	"testing"
 	"time"
 
-	gbat "github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/container/compute"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/compute"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/jobs"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
@@ -98,10 +97,10 @@ func TestCheckpoint1(t *testing.T) {
 	opts.CheckpointCfg.ExecutionInterval = 1
 	db := initDB(t, opts)
 	defer db.Close()
-	schema := catalog.MockSchema(13)
+	schema := catalog.MockSchema(13, 12)
 	schema.BlockMaxRows = 1000
 	schema.SegmentMaxBlocks = 2
-	bat := compute.MockBatch(schema.Types(), uint64(schema.BlockMaxRows), int(schema.PrimaryKey), nil)
+	bat := catalog.MockData(schema, schema.BlockMaxRows)
 	{
 		txn, _ := db.StartTxn(nil)
 		database, _ := txn.CreateDatabase("db")
@@ -122,9 +121,10 @@ func TestCheckpoint1(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Nil(t, txn.Commit())
 	}
-	time.Sleep(time.Millisecond * 20)
-	{
-		blockCnt := 0
+
+	blockCnt := 0
+	fn := func() bool {
+		blockCnt = 0
 		blockFn := func(entry *catalog.BlockEntry) error {
 			blockCnt++
 			return nil
@@ -132,9 +132,12 @@ func TestCheckpoint1(t *testing.T) {
 		processor := new(catalog.LoopProcessor)
 		processor.BlockFn = blockFn
 		err := db.Opts.Catalog.RecurLoop(processor)
-		assert.Nil(t, err)
-		assert.Equal(t, 2+3, blockCnt)
+		assert.NoError(t, err)
+		return blockCnt == 2+3
 	}
+	testutils.WaitExpect(1000, fn)
+	fn()
+	assert.Equal(t, 2+3, blockCnt)
 }
 
 func TestCheckpoint2(t *testing.T) {
@@ -142,22 +145,20 @@ func TestCheckpoint2(t *testing.T) {
 	opts.CacheCfg = new(options.CacheCfg)
 	opts.CacheCfg.IndexCapacity = 1000000
 	opts.CacheCfg.TxnCapacity = 1000000
-	opts.CacheCfg.InsertCapacity = 200
+	opts.CacheCfg.InsertCapacity = 400
 	// opts.CheckpointCfg = new(options.CheckpointCfg)
 	// opts.CheckpointCfg.ScannerInterval = 10
 	// opts.CheckpointCfg.ExecutionLevels = 2
 	// opts.CheckpointCfg.ExecutionInterval = 1
 	tae := initDB(t, opts)
 	defer tae.Close()
-	schema1 := catalog.MockSchema(4)
+	schema1 := catalog.MockSchema(4, 2)
 	schema1.BlockMaxRows = 10
 	schema1.SegmentMaxBlocks = 2
-	schema1.PrimaryKey = 2
-	schema2 := catalog.MockSchema(4)
+	schema2 := catalog.MockSchema(4, 2)
 	schema2.BlockMaxRows = 10
 	schema2.SegmentMaxBlocks = 2
-	schema2.PrimaryKey = 2
-	bat := compute.MockBatch(schema1.Types(), uint64(schema1.BlockMaxRows)*2, int(schema1.PrimaryKey), nil)
+	bat := catalog.MockData(schema1, schema1.BlockMaxRows*2)
 	bats := compute.SplitBatch(bat, 10)
 	var (
 		meta1 *catalog.TableEntry
@@ -174,14 +175,6 @@ func TestCheckpoint2(t *testing.T) {
 		t.Log(meta2.String())
 		assert.Nil(t, txn.Commit())
 	}
-	doAppend := func(data *gbat.Batch, name string) {
-		txn, _ := tae.StartTxn(nil)
-		db, _ := txn.GetDatabase("db")
-		rel, _ := db.GetRelationByName(name)
-		err := rel.Append(data)
-		assert.Nil(t, err)
-		assert.Nil(t, txn.Commit())
-	}
 	for i, data := range bats[0:8] {
 		var name string
 		if i%2 == 0 {
@@ -189,7 +182,7 @@ func TestCheckpoint2(t *testing.T) {
 		} else {
 			name = schema2.Name
 		}
-		doAppend(data, name)
+		appendClosure(t, data, name, tae, nil)()
 	}
 	var meta *catalog.BlockEntry
 	testutils.WaitExpect(1000, func() bool {
@@ -197,8 +190,9 @@ func TestCheckpoint2(t *testing.T) {
 	})
 	assert.Equal(t, uint64(4), tae.Wal.GetPenddingCnt())
 	t.Log(tae.Wal.GetPenddingCnt())
-	doAppend(bats[8], schema1.Name)
+	appendClosure(t, bats[8], schema1.Name, tae, nil)()
 	// t.Log(tae.MTBufMgr.String())
+
 	{
 		txn, _ := tae.StartTxn(nil)
 		db, err := txn.GetDatabase("db")
@@ -217,6 +211,7 @@ func TestCheckpoint2(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Nil(t, txn.Commit())
 	}
+
 	// testutils.WaitExpect(1000, func() bool {
 	// 	return tae.Wal.GetPenddingCnt() == 1
 	// })
@@ -236,10 +231,10 @@ func TestCheckpoint2(t *testing.T) {
 
 func TestSchedule1(t *testing.T) {
 	db := initDB(t, nil)
-	schema := catalog.MockSchema(13)
+	schema := catalog.MockSchema(13, 12)
 	schema.BlockMaxRows = 10
 	schema.SegmentMaxBlocks = 2
-	bat := compute.MockBatch(schema.Types(), uint64(schema.BlockMaxRows), int(schema.PrimaryKey), nil)
+	bat := catalog.MockData(schema, schema.BlockMaxRows)
 	{
 		txn, _ := db.StartTxn(nil)
 		database, _ := txn.CreateDatabase("db")
@@ -248,20 +243,7 @@ func TestSchedule1(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Nil(t, txn.Commit())
 	}
-	{
-		txn, _ := db.StartTxn(nil)
-		database, _ := txn.GetDatabase("db")
-		rel, _ := database.GetRelationByName(schema.Name)
-		it := rel.MakeBlockIt()
-		blk := it.GetBlock()
-		blkMeta := blk.GetMeta().(*catalog.BlockEntry)
-		factory := jobs.CompactBlockTaskFactory(blkMeta, db.Scheduler)
-		ctx := tasks.Context{Waitable: true}
-		task, err := db.Scheduler.ScheduleTxnTask(&ctx, tasks.DataCompactionTask, factory)
-		assert.Nil(t, err)
-		err = task.WaitDone()
-		assert.Nil(t, err)
-	}
+	compactBlocks(t, db, "db", schema, false)
 	t.Log(db.Opts.Catalog.SimplePPString(common.PPL1))
 	db.Close()
 }

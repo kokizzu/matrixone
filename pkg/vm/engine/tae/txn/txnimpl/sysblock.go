@@ -8,7 +8,7 @@ import (
 	movec "github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/container/compute"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/compute"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 )
@@ -157,7 +157,7 @@ func (blk *txnSysBlock) isPrimaryKey(schema *catalog.Schema, colIdx int) bool {
 	case catalog.SystemTable_DB_Name:
 		return attrName == catalog.SystemDBAttr_Name
 	}
-	return int(schema.PrimaryKey) == colIdx
+	return schema.IsPartOfPK(colIdx)
 }
 
 func (blk *txnSysBlock) getColumnTableData(colIdx int) (view *model.ColumnView, err error) {

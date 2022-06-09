@@ -21,11 +21,14 @@ import (
 	"github.com/RoaringBitmap/roaring"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+
+	// "github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/updates"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
@@ -43,6 +46,7 @@ type txnTable struct {
 	updateNodes  map[common.ID]txnif.UpdateNode
 	deleteNodes  map[common.ID]txnif.DeleteNode
 	entry        *catalog.TableEntry
+	schema       *catalog.Schema
 	logs         []wal.LogEntry
 	maxSegId     uint64
 	maxBlkId     uint64
@@ -55,6 +59,7 @@ func newTxnTable(store *txnStore, entry *catalog.TableEntry) *txnTable {
 	tbl := &txnTable{
 		store:       store,
 		entry:       entry,
+		schema:      entry.GetSchema(),
 		updateNodes: make(map[common.ID]txnif.UpdateNode),
 		deleteNodes: make(map[common.ID]txnif.DeleteNode),
 		logs:        make([]wal.LogEntry, 0),
@@ -89,6 +94,7 @@ func (tbl *txnTable) CollectCmd(cmdMgr *commandManager) (err error) {
 	for _, txnEntry := range tbl.txnEntries {
 		csn := cmdMgr.GetCSN()
 		cmd, err := txnEntry.MakeCommand(csn)
+		// logutil.Infof("%d-%d",csn,cmd.GetType())
 		if err != nil {
 			return err
 		}
@@ -258,7 +264,7 @@ func (tbl *txnTable) IsDeleted() bool {
 }
 
 func (tbl *txnTable) GetSchema() *catalog.Schema {
-	return tbl.entry.GetSchema()
+	return tbl.schema
 }
 
 func (tbl *txnTable) GetMeta() *catalog.TableEntry {
@@ -305,10 +311,25 @@ func (tbl *txnTable) AddUpdateNode(node txnif.UpdateNode) error {
 	return nil
 }
 
-func (tbl *txnTable) Append(data *batch.Batch) error {
-	err := tbl.BatchDedup(data.Vecs[tbl.entry.GetSchema().PrimaryKey])
-	if err != nil {
-		return err
+func (tbl *txnTable) GetSortColumns(data *batch.Batch) []*vector.Vector {
+	vs := make([]*vector.Vector, tbl.schema.GetSortKeyCnt())
+	for i := range vs {
+		vs[i] = data.Vecs[tbl.schema.SortKey.Defs[i].Idx]
+	}
+	return vs
+}
+
+// func (tbl *txnTable)
+
+func (tbl *txnTable) Append(data *batch.Batch) (err error) {
+	if tbl.schema.IsSinglePK() {
+		if err = tbl.DoBatchDedup(data.Vecs[tbl.schema.GetSingleSortKeyIdx()]); err != nil {
+			return
+		}
+	} else if tbl.schema.IsCompoundPK() {
+		if err = tbl.DoBatchDedup(tbl.GetSortColumns(data)...); err != nil {
+			return
+		}
 	}
 	if tbl.localSegment == nil {
 		tbl.localSegment = newLocalSegment(tbl)
@@ -506,23 +527,27 @@ func (tbl *txnTable) UncommittedRows() uint32 {
 	return tbl.localSegment.Rows()
 }
 
-func (tbl *txnTable) PreCommitDededup() (err error) {
-	if tbl.localSegment == nil {
+func (tbl *txnTable) PreCommitDedup() (err error) {
+	if tbl.localSegment == nil || !tbl.schema.HasPK() {
 		return
 	}
-	pks := tbl.localSegment.GetPrimaryColumn()
+	pks := tbl.localSegment.GetPKColumn()
+	err = tbl.DoDedup(pks, true)
+	return
+}
+
+func (tbl *txnTable) DoDedup(pks *vector.Vector, preCommit bool) (err error) {
 	segIt := tbl.entry.MakeSegmentIt(false)
 	for segIt.Valid() {
 		seg := segIt.Get().GetPayload().(*catalog.SegmentEntry)
-		if seg.GetID() < tbl.maxSegId {
+		if preCommit && seg.GetID() < tbl.maxSegId {
 			return
 		}
 		{
 			seg.RLock()
-			uncreated := seg.IsCreatedUncommitted()
-			dropped := seg.IsDroppedCommitted()
+			invalid := seg.IsDroppedCommitted() || seg.InTxnOrRollbacked()
 			seg.RUnlock()
-			if uncreated || dropped {
+			if invalid {
 				segIt.Next()
 				continue
 			}
@@ -540,15 +565,14 @@ func (tbl *txnTable) PreCommitDededup() (err error) {
 		blkIt := seg.MakeBlockIt(false)
 		for blkIt.Valid() {
 			blk := blkIt.Get().GetPayload().(*catalog.BlockEntry)
-			if blk.GetID() < tbl.maxBlkId {
+			if preCommit && blk.GetID() < tbl.maxBlkId {
 				return
 			}
 			{
 				blk.RLock()
-				uncreated := blk.IsCreatedUncommitted()
-				dropped := blk.IsDroppedCommitted()
+				invalid := blk.IsDroppedCommitted() || blk.InTxnOrRollbacked()
 				blk.RUnlock()
-				if uncreated || dropped {
+				if invalid {
 					blkIt.Next()
 					continue
 				}
@@ -573,52 +597,32 @@ func (tbl *txnTable) PreCommitDededup() (err error) {
 	return
 }
 
-func (tbl *txnTable) BatchDedup(pks *vector.Vector) (err error) {
+func (tbl *txnTable) DoBatchDedup(keys ...*vector.Vector) (err error) {
 	index := NewSimpleTableIndex()
-	err = index.BatchInsert(pks, 0, vector.Length(pks), 0, true)
-	if err != nil {
+	key := model.EncodeCompoundColumn(keys...)
+	if err = index.BatchInsert(key, 0, vector.Length(key), 0, true); err != nil {
 		return
 	}
-	h := newRelation(tbl)
-	segIt := h.MakeSegmentIt()
-	for segIt.Valid() {
-		seg := segIt.GetSegment()
-		if err = seg.BatchDedup(pks); err == txnbase.ErrDuplicated {
-			break
+
+	if tbl.localSegment != nil {
+		if err = tbl.localSegment.BatchDedup(key); err != nil {
+			return
 		}
-		if err == data.ErrPossibleDuplicate {
-			err = nil
-			blkIt := seg.MakeBlockIt()
-			for blkIt.Valid() {
-				block := blkIt.GetBlock()
-				var rowmask *roaring.Bitmap
-				// There were some deletes applied to state machine before. we need to check those delete nodes
-				if len(tbl.deleteNodes) > 0 {
-					fp := block.Fingerprint()
-					dn := tbl.deleteNodes[*fp]
-					// If a delete node was applied to this block, get the row mask
-					if dn != nil {
-						rowmask = dn.GetRowMaskRefLocked()
-					}
-				}
-				if err = block.BatchDedup(pks, rowmask); err != nil {
-					break
-				}
-				blkIt.Next()
-			}
-		}
-		if err != nil {
-			break
-		}
-		segIt.Next()
 	}
-	segIt.Close()
+
+	err = tbl.DoDedup(key, false)
 	return
 }
 
 func (tbl *txnTable) BatchDedupLocal(bat *batch.Batch) (err error) {
-	if tbl.localSegment != nil {
-		err = tbl.localSegment.BatchDedupByCol(bat.Vecs[tbl.GetSchema().PrimaryKey])
+	if tbl.localSegment == nil {
+		return
+	}
+	if tbl.schema.IsSinglePK() {
+		err = tbl.localSegment.BatchDedup(bat.Vecs[tbl.schema.GetSingleSortKeyIdx()])
+	} else {
+		key := model.EncodeCompoundColumn(tbl.GetSortColumns(bat)...)
+		err = tbl.localSegment.BatchDedup(key)
 	}
 	return
 }
